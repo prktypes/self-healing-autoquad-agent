@@ -1,147 +1,88 @@
 import os
 import time
-import json
-import re
 from github import Github, Auth
 from dotenv import load_dotenv
-import ollama
 
-from tools import run_terminal_command
+# Import the compiled multi-agent application from your squad file
+from squad_logic import squad_app
 
-# Load environment variables
+# Load environment variables securely from the .env file
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME = os.getenv("REPO_NAME")
 
-# Initialize GitHub Client
+# Initialize the GitHub Client using the 2026 recommended Auth token structure
 auth = Auth.Token(GITHUB_TOKEN)
 g = Github(auth=auth)
 repo = g.get_repo(REPO_NAME)
 
-
-def analyze_pr(pr):
-    print(f"--- Analyzing PR #{pr.number}: {pr.title} ---")
+def analyze_pr_with_squad(pr):
+    print(f"\n==================================================")
+    print(f" [Orchestrator] Ingesting PR #{pr.number}: '{pr.title}'")
+    print(f"==================================================")
     
+    # Extract the code changes (the raw diff data) from the PR
     files = pr.get_files()
     diff_text = ""
     for file in files:
         diff_text += f"\nFile: {file.filename}\n{file.patch}\n"
 
-    prompt = f"""
-    You are an AI Code Reviewer. Analyze this PR diff and provide a concise review.
-    Focus on logic errors, security, and performance.
-    
-    Format your response in Markdown. Use bold for headers.
-    
-    PR Title: {pr.title}
-    Diff Content:
-    {diff_text}
-    """
+    # Initialize the universal Shared Memory state for LangGraph
+    initial_state = {
+        "messages": [],
+        "code_diff": diff_text,
+        "security_report": "Pending scan...",
+        "performance_report": "Pending scan...",
+        "janitor_report": "Pending scan...",
+        "is_ready_to_push": False
+    }
 
-    response = ollama.generate(model='qwen2.5-coder:7b', prompt=prompt)
-    analysis = response['response']
+    print(" Handing execution control to the LangGraph Squad...")
+    # Invoke the graph. This handles Fan-Out, Fan-In, and Self-Healing loops automatically
+    final_state = squad_app.invoke(initial_state)
+    print(" LangGraph execution cycle complete.")
 
-    comment_body = f"AI Agent Review\n\n{analysis}"
-    pr.create_issue_comment(comment_body)
-    
-    print("ANALYSIS POSTED TO GITHUB.")
-
-
-def autonomous_agent_loop(user_prompt):
-    system_prompt = (
-        "You are an autonomous AI engineer on WINDOWS. You use PowerShell. "
-        "To perform actions, you MUST use the 'run_terminal_command' tool. "
-        "If you need to run multiple commands, do them one by one. "
-        "Wait for the output of each command before moving to the next step."
+    # Synthesize the final consolidated markdown report for GitHub
+    comment_body = (
+        f"##  Autonomous Engineering Squad Report\n\n"
+        f"Our specialized agents have processed the proposed changes locally on an AMD Ryzen 7 host system.\n\n"
+        f"###  Security Audit\n{final_state.get('security_report', 'No report generated.')}\n\n"
+        f"###  Performance Review\n{final_state.get('performance_report', 'No report generated.')}\n\n"
+        f"###  Code Style & Tech Debt\n{final_state.get('janitor_report', 'No report generated.')}\n\n"
+        f"---\n"
+        f"###  Final Evaluation Status\n"
     )
-    
-    messages = [
-        {'role': 'system', 'content': system_prompt},
-        {'role': 'user', 'content': user_prompt}
-    ]
 
-    # Define the tool configuration
-    tools = [{
-        'type': 'function',
-        'function': {
-            'name': 'run_terminal_command',
-            'description': 'Execute a PowerShell command locally.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'command': {'type': 'string', 'description': 'The PowerShell command'}
-                },
-                'required': ['command']
-            }
-        }
-    }]
+    if final_state.get("is_ready_to_push"):
+        comment_body += " **APPROVED:** The code satisfies all safety, performance, and structural guidelines. Ready to merge!"
+    else:
+        comment_body += " **CORRECTIONS APPLIED:** Critical defects were found. The local Fixer Agent was deployed to rewrite and patch the filesystem."
 
-    for turn in range(10):  # Increased turns to allow for more fixing
-        print(f"\n--- Turn {turn + 1} ---")
-        response = ollama.chat(model='qwen2.5-coder:7b', messages=messages, tools=tools)
-        msg = response['message']
-        messages.append(msg)
-
-        # 1. Check for official tool calls
-        tool_calls = msg.get('tool_calls', [])
-        
-        # 2. Backup: If model wrote JSON as text, try to extract it
-        if not tool_calls and '{"name":' in (msg.get('content') or ''):
-            try:
-                # Basic extraction of JSON from text
-                start = msg['content'].find('{')
-                end = msg['content'].rfind('}') + 1
-                json_data = json.loads(msg['content'][start:end])
-                # Format it like a real tool call for the logic below
-                tool_calls = [{'function': json_data}]
-            except:
-                pass
-
-        # If absolutely no tool calls, we are finished
-        if not tool_calls:
-            print(f" Final Response: {msg['content']}")
-            break
-
-        # 3. Execute the tools
-        for tool in tool_calls:
-            name = tool['function']['name']
-            args = tool['function']['arguments']
-            
-            if name == 'run_terminal_command':
-                cmd = args['command']
-                print(f"  Executing: {cmd}")
-                obs = run_terminal_command(cmd)
-                
-                print(f" Observation: {obs['output']}")
-                
-                # Feedback loop: Tell the agent what happened
-                messages.append({
-                    'role': 'tool',
-                    'content': obs['output'],
-                    'name': name
-                })
-
+    # Post the combined findings as a master comment on the GitHub PR
+    print(" Posting compiled multi-agent feedback to GitHub...")
+    pr.create_issue_comment(comment_body)
+    print(" Feedback successfully published.")
 
 def main():
-    print(f"Monitoring repository: {REPO_NAME}...")
+    print(f" Monitoring repository: {REPO_NAME} for open Pull Requests...")
     processed_prs = set()
 
     while True:
-        pulls = repo.get_pulls(state='open', sort='created')
+        try:
+            # Safely fetch active proposals from the remote repository
+            pulls = repo.get_pulls(state='open', sort='created')
+            
+            for pr in pulls:
+                if pr.id not in processed_prs:
+                    analyze_pr_with_squad(pr)
+                    processed_prs.add(pr.id)
+            
+        except Exception as e:
+            print(f" Connection or runtime issue encountered: {e}")
         
-        for pr in pulls:
-            if pr.id not in processed_prs:
-                analyze_pr(pr)
-                processed_prs.add(pr.id)
-        
+        # Poll every 60 seconds to manage local processing loops evenly
+        print(" Sleeping for 60 seconds before next repository scan...")
         time.sleep(60)
 
-
 if __name__ == "__main__":
-    # main()  # Uncomment if you want PR monitoring
-
-    while True:
-        user_input = input("Enter a command for the agent (or 'exit' to quit): ")
-        if user_input.lower() == 'exit':
-            break
-        autonomous_agent_loop(user_input)
+    main()

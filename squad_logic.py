@@ -1,158 +1,218 @@
-from typing import Annotated, TypedDict, List
-from langgraph.graph.message import add_messages
+import json
 import ollama
-from tools import run_terminal_command 
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from tools import run_terminal_command
 
-# This is the "Shared Memory" for your squad thats why we using typeddict,
-# it defines the structure of the state that all agents will read from
-# and write to.
+# ==========================================
+#  1. SHARED MEMORY STATE
+# ==========================================
 class SquadState(TypedDict):
-    # 'add_messages' ensures new reports are appended to the history
+    """The universal state object accessed and altered by all agents."""
     messages: Annotated[list, add_messages]
     code_diff: str
     security_report: str
     performance_report: str
     janitor_report: str
-    is_code_safe: bool
     is_ready_to_push: bool
 
-# Security Agent: Focuses on identifying vulnerabilities, secrets, and compliance issues in the code.
+# ==========================================
+# 🛡️ 2. PARALLEL EXPERT AGENTS (FAN-OUT)
+# ==========================================
 def security_agent(state: SquadState):
-    print(" Security Researcher is analyzing...")
+    print("\n  [Security Expert] Scanning for vulnerabilities...")
     prompt = (
-        f"Analyze this code for security vulnerabilities (OWASP Top 10, secrets):\n\n"
-        f"{state['code_diff']}\n\n"
-        "Provide a concise report. If safe, start with 'SAFE'."
+        f"You are an expert Security Researcher. Analyze this code diff for vulnerabilities "
+        f"(e.g., hardcoded secrets, injection flaws, OWASP issues):\n\n{state['code_diff']}\n\n"
+        "Provide a clear, concise summary of your security findings."
     )
-    # Using the local Qwen brain
     response = ollama.chat(model='qwen2.5-coder:7b', messages=[{'role': 'user', 'content': prompt}])
-    report = response['message']['content']
-    
-    # Update state: Append to messages and update security_report
-    return {
-        "messages": [f"Security Report: {report}"],
-        "security_report": report,
-        "is_code_safe": "SAFE" in report.upper()
-    }
+    return {"security_report": response['message']['content']}
 
 def performance_agent(state: SquadState):
-    print(" Performance Engineer is analyzing...")
+    print(" [Performance Expert] Evaluating efficiency...")
     prompt = (
-        f"Analyze this code for performance bottlenecks (O(N^2) loops, database N+1):\n\n"
-        f"{state['code_diff']}"
+        f"You are a performance optimization engineer. Analyze this code diff for bottlenecks "
+        f"(e.g., inefficient loops, nested database queries, memory leaks):\n\n{state['code_diff']}\n\n"
+        "Provide a clear, concise summary of your performance findings."
     )
     response = ollama.chat(model='qwen2.5-coder:7b', messages=[{'role': 'user', 'content': prompt}])
     return {"performance_report": response['message']['content']}
 
-
 def janitor_agent(state: SquadState):
-    print(" The Janitor is checking tech debt...")
+    print(" [Janitor Expert] Checking code style and debt...")
     prompt = (
-        f"Check this code for naming conventions and architectural debt:\n\n"
-        f"{state['code_diff']}"
+        f"You are a Tech Debt Janitor. Analyze this code diff for structural irregularities, "
+        f"anti-patterns, and code style issues:\n\n{state['code_diff']}\n\n"
+        "Provide a clear, concise summary of structural/formatting issues."
     )
     response = ollama.chat(model='qwen2.5-coder:7b', messages=[{'role': 'user', 'content': prompt}])
     return {"janitor_report": response['message']['content']}
 
-def lead_engineer_node(state: SquadState):
-    print(" Lead Engineer is synthesizing reports...")
+# ==========================================
+#  3. THE AGGREGATOR (FAN-IN)
+# ==========================================
+def lead_engineer_agent(state: SquadState):
+    print("\n👨‍💼 [Lead Engineer] Aggregating squad findings...")
     
-    # We combine all expert reports for the Lead's context
-    combined_reports = (
-        f"SECURITY REPORT: {state['security_report']}\n"
-        f"PERFORMANCE REPORT: {state['performance_report']}\n"
-        f"JANITOR REPORT: {state['janitor_report']}"
+    reports = (
+        f"--- SECURITY REPORT ---\n{state['security_report']}\n\n"
+        f"--- PERFORMANCE REPORT ---\n{state['performance_report']}\n\n"
+        f"--- TECH DEBT REPORT ---\n{state['janitor_report']}\n"
     )
     
     prompt = (
-        "You are the Lead Software Engineer. Review the following expert reports for this PR.\n"
-        "Decide if there are 'CRITICAL' issues that need fixing, or if the PR is 'READY'.\n\n"
-        f"REPORTS:\n{combined_reports}\n\n"
-        "Final Decision (READY or CRITICAL):"
+        f"You are the Lead Software Engineer. Review these specialized reports for a proposed code change:\n\n"
+        f"{reports}\n\n"
+        "Are there any CRITICAL defects, security flaws, or bugs that must be corrected before merge?\n"
+        "Respond EXACTLY in this JSON format to issue your engineering decision:\n"
+        '{"status": "CRITICAL", "reason": "Brief explanation of major bugs"}\n'
+        'or\n'
+        '{"status": "APPROVED", "reason": "Code looks production ready"}'
     )
     
     response = ollama.chat(model='qwen2.5-coder:7b', messages=[{'role': 'user', 'content': prompt}])
-    decision = response['message']['content']
+    content = response['message']['content']
     
-    # If the Lead sees 'CRITICAL', we flag it for the Fixer agent
-    needs_fix = "CRITICAL" in decision.upper()
+    # Robust cleanup to capture JSON strings from local model outputs
+    try:
+        start_idx = content.find('{')
+        end_idx = content.rfind('}') + 1
+        data = json.loads(content[start_idx:end_idx])
+        is_approved = data.get("status") == "APPROVED"
+    except Exception:
+        # Fallback security check if JSON decoding stumbles
+        print("⚠️  Lead Engineer output formatting issue. Parsing text content directly...")
+        is_approved = "APPROVED" in content.upper() and "CRITICAL" not in content.upper()
+
+    print(f" [Decision] Lead Engineer status: {'APPROVED' if is_approved else 'CRITICAL (Requires Fixes)'}")
+    return {"is_ready_to_push": is_approved, "messages": [f"Lead decision evaluation finalized."]}
+
+# ==========================================
+#  4. THE SELF-HEALING FIXER (THE REPAIR EDGE)
+# ==========================================
+def fixer_agent(state: SquadState):
+    print("\n [Fixer Agent] Resolving issues identified by the squad...")
     
-    return {
-        "messages": [f"Lead Engineer Decision: {decision}"],
-        "is_ready_to_push": not needs_fix
-    }
-
-
-from tools import run_terminal_command
-
-def fixer_node(state: SquadState):
-    print(" Fixer Agent is applying repairs...")
+    system_instruction = (
+        "You are an autonomous repair engineer operating on a WINDOWS machine using PowerShell. "
+        "Your mission is to execute local commands to resolve file bugs. You have access to a tool "
+        "called 'run_terminal_command' to run shell operations. Execute file fixes directly, "
+        "and complete your task when corrections are verified."
+    )
     
-    # The Fixer reads all the expert complaints from the state
-    full_context = (
-        f"Security Issues: {state['security_report']}\n"
-        f"Performance Issues: {state['performance_report']}\n"
-        f"Janitor Issues: {state['janitor_report']}"
+    context_complaints = (
+        f"Security Feedback: {state['security_report']}\n"
+        f"Performance Feedback: {state['performance_report']}\n"
+        f"Janitor Feedback: {state['janitor_report']}\n"
     )
     
     prompt = (
-        f"You are a Fixer Agent. Based on these reports, use the 'run_terminal_command' "
-        f"to fix the code in the current directory.\n\nREPORTS:\n{full_context}"
+        f"Correct any critical flaws across code files in the directory based on this feedback:\n"
+        f"{context_complaints}\n"
+        "Use the terminal function tool to make changes or test scripts as needed. Execute commands sequentially."
     )
     
-    # We use your tool-using logic here (simplified for the node)
-    response = ollama.chat(
-        model='qwen2.5-coder:7b', 
-        messages=[{'role': 'user', 'content': prompt}],
-        tools=[{ 'type': 'function', 'function': {'name': 'run_terminal_command'}}] # Use your tool def here
-    )
+    # Format the function definitions to instruct Ollama about terminal access
+    tools_config = [{
+        'type': 'function',
+        'function': {
+            'name': 'run_terminal_command',
+            'description': 'Executes a PowerShell command locally on Windows to edit or check code files.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'command': {'type': 'string', 'description': 'The PowerShell expression to run.'}
+                },
+                'required': ['command']
+            }
+        }
+    }]
     
-    # (Execution logic from Phase 2 goes here to run the command)
+    messages = [
+        {'role': 'system', 'content': system_instruction},
+        {'role': 'user', 'content': prompt}
+    ]
     
-    return {"messages": ["Fixer has applied changes and verified locally."]}
+    # Allow the agent up to 3 diagnostic script execution loops
+    for turn in range(3):
+        response = ollama.chat(model='qwen2.5-coder:7b', messages=messages, tools=tools_config)
+        msg = response['message']
+        messages.append(msg)
+        
+        tool_calls = msg.get('tool_calls', [])
+        
+        # Parse text output if model generates a raw string representation of JSON
+        if not tool_calls and '{"name":' in (msg.get('content') or ''):
+            try:
+                s = msg['content'].find('{')
+                e = msg['content'].rfind('}') + 1
+                tool_calls = [{'function': json.loads(msg['content'][s:e])}]
+            except Exception:
+                pass
+                
+        if not tool_calls:
+            break
+            
+        for call in tool_calls:
+            if call['function']['name'] == 'run_terminal_command':
+                cmd = call['function']['arguments']['command']
+                print(f"     Fixer Action: Executing -> {cmd}")
+                observation = run_terminal_command(cmd)
+                print(f"    Result: {observation['output'].strip()}")
+                
+                messages.append({
+                    'role': 'tool',
+                    'content': observation['output'],
+                    'name': 'run_terminal_command'
+                })
+                
+    return {"messages": ["Fixer completed an automation turn."]}
 
-
-def route_after_lead(state: SquadState):
+# ==========================================
+#  5. CONDITIONAL ROUTING MECHANICS
+# ==========================================
+def conditional_router(state: SquadState):
+    """Evaluates state flags to select the next processing path."""
     if state["is_ready_to_push"]:
-        return "approved"
-    return "needs_fix"
+        return "approved_path"
+    return "fix_path"
 
-
-# Building the orchestration logic to run all agents and update the shared state
-# using langgraph
-
-from langgraph.graph import StateGraph, START, END
-
+# ==========================================
+# 🕸️ 6. LANGGRAPH ORCHESTRATION COMPILATION
+# ==========================================
 builder = StateGraph(SquadState)
 
-# Add all nodes
-builder.add_node("security", security_agent)
-builder.add_node("performance", performance_agent)
-builder.add_node("janitor", janitor_agent)
-builder.add_node("lead_engineer", lead_engineer_node)
-builder.add_node("fixer", fixer_node)
+# Step A: Define Nodes
+builder.add_node("security_node", security_agent)
+builder.add_node("performance_node", performance_agent)
+builder.add_node("janitor_node", janitor_agent)
+builder.add_node("lead_engineer_node", lead_engineer_agent)
+builder.add_node("fixer_node", fixer_agent)
 
-# --- FAN-OUT ---
-# Start all experts at once
-builder.add_edge(START, "security")
-builder.add_edge(START, "performance")
-builder.add_edge(START, "janitor")
+# Step B: Establish Fan-Out
+builder.add_edge(START, "security_node")
+builder.add_edge(START, "performance_node")
+builder.add_edge(START, "janitor_node")
 
-# --- FAN-IN ---
-# Wait for all experts to finish and send results to the Lead
-builder.add_edge("security", "lead_engineer")
-builder.add_edge("performance", "lead_engineer")
-builder.add_edge("janitor", "lead_engineer")
+# Step C: Establish Fan-In
+builder.add_edge("security_node", "lead_engineer_node")
+builder.add_edge("performance_node", "lead_engineer_node")
+builder.add_edge("janitor_node", "lead_engineer_node")
 
+# Step D: Apply Conditional Router Loop
 builder.add_conditional_edges(
-    "lead_engineer",
-    route_after_lead,
+    "lead_engineer_node",
+    conditional_router,
     {
-        "approved": END,            # PR is perfect and we are done
-        "needs_fix": "fixer"        # PR has issues, sending to the fixer
+        "approved_path": END,
+        "fix_path": "fixer_node"
     }
 )
 
-builder.add_edge("fixer","security")
+# Step E: Re-Route Fixer modifications back into the Experts for evaluation
+builder.add_edge("fixer_node", "security_node")
 
+# Compile into an executable app instance
 squad_app = builder.compile()

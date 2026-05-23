@@ -1,4 +1,4 @@
-import subprocess
+import subprocess #used as a bridge to run terminal commands, which is necessary for the agent to perform tasks that require command-line interaction.
 
 def run_terminal_command(command: str):
     try:

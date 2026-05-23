@@ -1,0 +1,4 @@
+ollama
+PyGithub
+python-dotenv
+langgraph
