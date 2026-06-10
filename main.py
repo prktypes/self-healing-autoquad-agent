@@ -2,32 +2,51 @@ import os
 import time
 from github import Github, Auth
 from dotenv import load_dotenv
-
-# Import the compiled multi-agent application from your squad file
 from squad_logic import squad_app
 
-# Load environment variables securely from the .env file
+# Force-load environment variables from the current working directory
 load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME = os.getenv("REPO_NAME")
 
-# Initialize the GitHub Client using the 2026 recommended Auth token structure
+# --- DIAGNOSTIC SECURITY VERIFICATION LOGS ---
+print("==================================================")
+print("[Diag] Checking environment initialization...")
+if not GITHUB_TOKEN:
+    print("[Diag ERROR] GITHUB_TOKEN is completely EMPTY or None! Check your .env file placement.")
+else:
+    # Safely print just the prefix to verify it is loading without exposing it
+    print(f"[Diag] GITHUB_TOKEN loaded successfully. Begins with: {GITHUB_TOKEN[:12]}...")
+
+if not REPO_NAME:
+    print("[Diag ERROR] REPO_NAME is missing from your environment setup.")
+else:
+    print(f"[Diag] Target Repository registered: {REPO_NAME}")
+print("==================================================")
+
+# Initialize the credential handshake configuration
 auth = Auth.Token(GITHUB_TOKEN)
 g = Github(auth=auth)
 repo = g.get_repo(REPO_NAME)
 
 def analyze_pr_with_squad(pr):
     print(f"\n==================================================")
-    print(f" [Orchestrator] Ingesting PR #{pr.number}: '{pr.title}'")
+    print(f"[Orchestrator] Ingesting PR #{pr.number}: '{pr.title}'")
     print(f"==================================================")
     
-    # Extract the code changes (the raw diff data) from the PR
     files = pr.get_files()
     diff_text = ""
+    
     for file in files:
         diff_text += f"\nFile: {file.filename}\n{file.patch}\n"
+        try:
+            file_content = repo.get_contents(file.filename, ref=pr.head.sha).decoded_content.decode('utf-8')
+            with open(file.filename, "w", encoding="utf-8") as f:
+                f.write(file_content)
+            print(f"[Workspace] Cached local file copy: {file.filename}")
+        except Exception as e:
+            print(f"[Warning] Could not cache local copy of {file.filename}: {e}")
 
-    # Initialize the universal Shared Memory state for LangGraph
     initial_state = {
         "messages": [],
         "code_diff": diff_text,
@@ -37,51 +56,44 @@ def analyze_pr_with_squad(pr):
         "is_ready_to_push": False
     }
 
-    print(" Handing execution control to the LangGraph Squad...")
-    # Invoke the graph. This handles Fan-Out, Fan-In, and Self-Healing loops automatically
+    print("[Orchestrator] Handing execution to LangGraph Squad...")
     final_state = squad_app.invoke(initial_state)
-    print(" LangGraph execution cycle complete.")
+    print("[Orchestrator] LangGraph execution cycle complete.")
 
-    # Synthesize the final consolidated markdown report for GitHub
     comment_body = (
-        f"##  Autonomous Engineering Squad Report\n\n"
+        f"## Autonomous Engineering Squad Report\n\n"
         f"Our specialized agents have processed the proposed changes locally on an AMD Ryzen 7 host system.\n\n"
-        f"###  Security Audit\n{final_state.get('security_report', 'No report generated.')}\n\n"
-        f"###  Performance Review\n{final_state.get('performance_report', 'No report generated.')}\n\n"
-        f"###  Code Style & Tech Debt\n{final_state.get('janitor_report', 'No report generated.')}\n\n"
+        f"### Security Audit\n{final_state.get('security_report', 'No report generated.')}\n\n"
+        f"### Performance Review\n{final_state.get('performance_report', 'No report generated.')}\n\n"
+        f"### Code Style & Tech Debt\n{final_state.get('janitor_report', 'No report generated.')}\n\n"
         f"---\n"
-        f"###  Final Evaluation Status\n"
+        f"### Final Evaluation Status\n"
     )
 
     if final_state.get("is_ready_to_push"):
-        comment_body += " **APPROVED:** The code satisfies all safety, performance, and structural guidelines. Ready to merge!"
+        comment_body += "**APPROVED:** The code satisfies safety, performance, and structural guidelines. Ready to merge."
     else:
-        comment_body += " **CORRECTIONS APPLIED:** Critical defects were found. The local Fixer Agent was deployed to rewrite and patch the filesystem."
+        comment_body += "**CORRECTIONS APPLIED:** Critical defects were found. The local Fixer Agent was deployed to rewrite files."
 
-    # Post the combined findings as a master comment on the GitHub PR
-    print(" Posting compiled multi-agent feedback to GitHub...")
+    print("[Orchestrator] Posting feedback to GitHub...")
     pr.create_issue_comment(comment_body)
-    print(" Feedback successfully published.")
+    print("[Success] Feedback successfully published.")
 
 def main():
-    print(f" Monitoring repository: {REPO_NAME} for open Pull Requests...")
+    print(f"[Start] Monitoring repository: {REPO_NAME} for open Pull Requests...")
     processed_prs = set()
 
     while True:
         try:
-            # Safely fetch active proposals from the remote repository
             pulls = repo.get_pulls(state='open', sort='created')
-            
             for pr in pulls:
                 if pr.id not in processed_prs:
                     analyze_pr_with_squad(pr)
                     processed_prs.add(pr.id)
-            
         except Exception as e:
-            print(f" Connection or runtime issue encountered: {e}")
+            print(f"[Error] Connection or runtime issue: {e}")
         
-        # Poll every 60 seconds to manage local processing loops evenly
-        print(" Sleeping for 60 seconds before next repository scan...")
+        print("[Idle] Sleeping for 60 seconds before next repository scan...")
         time.sleep(60)
 
 if __name__ == "__main__":
